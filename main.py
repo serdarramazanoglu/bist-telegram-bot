@@ -296,7 +296,8 @@ def saatlik_tarama():
     log.info("⏰ Tarama başlıyor...")
     now=datetime.datetime.now(); saat=now.hour+now.minute/60
     if now.weekday()>=5: log.info("Hafta sonu."); return
-    if not(9.5<=saat<=18.6): log.info(f"Borsa kapalı {now.strftime('%H:%M')}."); return
+    # Borsa saatleri: 10:00 - 18:00 arası tarama yap
+    if not(10.0<=saat<18.0): log.info(f"Borsa saati dışı {now.strftime('%H:%M')}, tarama yapılmıyor."); return
 
     tum_sonuclar={}
     for periyot in PERIYOTLAR:
