@@ -6,6 +6,7 @@ Strateji:
   🟢 AL  → 4 periyotun TAMAMINDA BB alt banda değdi / aşağı kırdı
   🔴 SAT → 4 periyotun TAMAMINDA BB üst banda değdi / yukarı kırdı
 Tarama: 15 dakikada bir, 10:00 - 18:00
+Değişiklik yoksa mesaj gönderilmez.
 """
 
 import os, time, logging, schedule, datetime, warnings
@@ -27,8 +28,8 @@ BB_DEV    = 2
 PERIYOTLAR = [
     {"key": "30m", "ad": "30dk", "interval": "30m", "period": "5d"},
     {"key": "1h",  "ad": "1S",   "interval": "1h",  "period": "7d"},
-    {"key": "2h",  "ad": "2S",   "interval": "1h",  "period": "14d"},  # resample
-    {"key": "4h",  "ad": "4S",   "interval": "1h",  "period": "30d"},  # resample
+    {"key": "2h",  "ad": "2S",   "interval": "1h",  "period": "14d"},
+    {"key": "4h",  "ad": "4S",   "interval": "1h",  "period": "30d"},
 ]
 
 BIST100 = list(dict.fromkeys([
@@ -63,10 +64,6 @@ def resample(df, rule):
     }).dropna()
 
 def bb_sinyal(ticker, pconf):
-    """
-    Tek periyot için BB sinyali döndürür.
-    'AL' | 'SAT' | None
-    """
     try:
         df = yf.download(
             ticker + '.IS',
@@ -84,6 +81,7 @@ def bb_sinyal(ticker, pconf):
         close = df['Close'].squeeze()
         bb    = ta.volatility.BollingerBands(close, window=BB_WINDOW, window_dev=BB_DEV)
         son   = df.iloc[-1]
+        prev  = df.iloc[-2]
 
         fiyat    = float(son['Close'])
         bb_ust   = float(bb.bollinger_hband().iloc[-1])
@@ -91,23 +89,14 @@ def bb_sinyal(ticker, pconf):
         bb_mid   = float(bb.bollinger_mavg().iloc[-1])
         son_low  = float(son['Low'])
         son_high = float(son['High'])
-        prev     = df.iloc[-2]
         degisim  = (fiyat - float(prev['Close'])) / float(prev['Close']) * 100
 
-        # AL: alt banda değdi veya aşağı kırdı
         if son_low <= bb_alt or fiyat <= bb_alt:
-            return {
-                'sinyal': 'AL', 'fiyat': round(fiyat, 2),
-                'bb_ust': round(bb_ust, 2), 'bb_alt': round(bb_alt, 2),
-                'bb_mid': round(bb_mid, 2), 'degisim': round(degisim, 2),
-            }
-        # SAT: üst banda değdi veya yukarı kırdı
+            return {'sinyal':'AL','fiyat':round(fiyat,2),'bb_ust':round(bb_ust,2),
+                    'bb_alt':round(bb_alt,2),'bb_mid':round(bb_mid,2),'degisim':round(degisim,2)}
         elif son_high >= bb_ust or fiyat >= bb_ust:
-            return {
-                'sinyal': 'SAT', 'fiyat': round(fiyat, 2),
-                'bb_ust': round(bb_ust, 2), 'bb_alt': round(bb_alt, 2),
-                'bb_mid': round(bb_mid, 2), 'degisim': round(degisim, 2),
-            }
+            return {'sinyal':'SAT','fiyat':round(fiyat,2),'bb_ust':round(bb_ust,2),
+                    'bb_alt':round(bb_alt,2),'bb_mid':round(bb_mid,2),'degisim':round(degisim,2)}
         return None
 
     except Exception as e:
@@ -127,11 +116,16 @@ def tg(mesaj):
     except Exception as e:
         log.error(f"TG hata: {e}"); return False
 
-# ── ANA TARAMA ────────────────────────────────────────────────────────────────
+# ── DURUM ─────────────────────────────────────────────────────────────────────
+# Önceki tarama sonuçları — {ticker: 'AL'/'SAT'}
+onceki_durum = {}
 gun_al  = []
 gun_sat = []
 
+# ── ANA TARAMA ────────────────────────────────────────────────────────────────
 def tarama():
+    global onceki_durum
+
     now  = datetime.datetime.now()
     saat = now.hour + now.minute / 60
     if now.weekday() >= 5: log.info("Hafta sonu."); return
@@ -139,10 +133,10 @@ def tarama():
         log.info(f"Borsa kapalı ({now.strftime('%H:%M')})."); return
 
     now_str = now.strftime("%d.%m.%Y %H:%M")
-    log.info(f"🔍 Tarama başlıyor — {now_str}")
+    log.info(f"🔍 Tarama — {now_str}")
 
-    konfirm_al  = []  # 4 periyotun tamamında AL
-    konfirm_sat = []  # 4 periyotun tamamında SAT
+    # ── 4 periyot konfirmasyon ──
+    yeni_durum = {}  # {ticker: 'AL'/'SAT'} — sadece 4 periyot konfirmasyonu olanlar
 
     for ticker in BIST100:
         sonuclar = {}
@@ -150,96 +144,104 @@ def tarama():
             r = bb_sinyal(ticker, pconf)
             sonuclar[pconf['key']] = r
 
-        # 4 periyotun tamamında sinyal var mı?
-        hepsi_var = all(sonuclar[p['key']] is not None for p in PERIYOTLAR)
-        if not hepsi_var:
+        # 4 periyotun tamamında sinyal olmalı
+        if not all(sonuclar[p['key']] is not None for p in PERIYOTLAR):
             continue
 
-        # 4 periyotun tamamında AYNI yön mü?
         yonler = [sonuclar[p['key']]['sinyal'] for p in PERIYOTLAR]
-        if all(y == 'AL' for y in yonler):
-            # Son periyotun (4h) bb değerlerini al — en güvenilir
-            ref = sonuclar['4h']
-            konfirm_al.append({
-                'ticker':  ticker,
-                'fiyat':   ref['fiyat'],
-                'degisim': ref['degisim'],
-                'bb_ust':  ref['bb_ust'],
-                'bb_alt':  ref['bb_alt'],
-                'bb_mid':  ref['bb_mid'],
-                'detay':   {p['key']: sonuclar[p['key']] for p in PERIYOTLAR},
-            })
+
+        if all(y == 'AL'  for y in yonler):
+            yeni_durum[ticker] = {'yon': 'AL',  'data': sonuclar}
         elif all(y == 'SAT' for y in yonler):
-            ref = sonuclar['4h']
-            konfirm_sat.append({
-                'ticker':  ticker,
-                'fiyat':   ref['fiyat'],
-                'degisim': ref['degisim'],
-                'bb_ust':  ref['bb_ust'],
-                'bb_alt':  ref['bb_alt'],
-                'bb_mid':  ref['bb_mid'],
-                'detay':   {p['key']: sonuclar[p['key']] for p in PERIYOTLAR},
-            })
+            yeni_durum[ticker] = {'yon': 'SAT', 'data': sonuclar}
 
         time.sleep(0.1)
 
-    log.info(f"✅ Tamamlandı: 🟢 AL:{len(konfirm_al)}  🔴 SAT:{len(konfirm_sat)}")
+    # ── Değişiklik kontrolü ──
+    yeni_al_set  = {t for t,v in yeni_durum.items() if v['yon'] == 'AL'}
+    yeni_sat_set = {t for t,v in yeni_durum.items() if v['yon'] == 'SAT'}
+    eski_al_set  = {t for t,v in onceki_durum.items() if v['yon'] == 'AL'}
+    eski_sat_set = {t for t,v in onceki_durum.items() if v['yon'] == 'SAT'}
 
-    # Sinyal yoksa sessiz kal
-    if not konfirm_al and not konfirm_sat:
-        log.info("Bu taramada 4 periyot konfirmasyon sinyali yok.")
+    degisiklik = (yeni_al_set != eski_al_set) or (yeni_sat_set != eski_sat_set)
+
+    # Hiç sinyal yoksa ve önceki de yoksa → sessiz
+    if not yeni_durum and not onceki_durum:
+        log.info("Sinyal yok, değişiklik yok → sessiz.")
         return
 
+    # Değişiklik yoksa → sessiz
+    if not degisiklik:
+        log.info(f"Değişiklik yok (AL:{len(yeni_al_set)} SAT:{len(yeni_sat_set)}) → mesaj gönderilmedi.")
+        return
+
+    # ── Değişiklik var — ne değişti? ──
+    yeni_gelen_al  = yeni_al_set  - eski_al_set   # yeni eklenen AL
+    yeni_gelen_sat = yeni_sat_set - eski_sat_set   # yeni eklenen SAT
+    giden_al       = eski_al_set  - yeni_al_set    # AL listesinden çıkan
+    giden_sat      = eski_sat_set - yeni_sat_set   # SAT listesinden çıkan
+    al_sat_gecis   = yeni_al_set  & eski_sat_set   # SAT'tan AL'a geçen
+    sat_al_gecis   = yeni_sat_set & eski_al_set    # AL'dan SAT'a geçen
+
+    log.info(f"✅ Değişiklik var! AL:{len(yeni_al_set)} SAT:{len(yeni_sat_set)} | "
+             f"+AL:{len(yeni_gelen_al)} +SAT:{len(yeni_gelen_sat)} "
+             f"-AL:{len(giden_al)} -SAT:{len(giden_sat)}")
+
     # Gün içi kayıt
-    gun_al.extend([r['ticker'] for r in konfirm_al])
-    gun_sat.extend([r['ticker'] for r in konfirm_sat])
+    gun_al.extend(list(yeni_al_set))
+    gun_sat.extend(list(yeni_sat_set))
 
     # ── Mesaj ──
     msg = (
-        f"🚨 <b>BB 4 Periyot Konfirmasyon Sinyali</b>\n"
-        f"🕐 {now_str}\n"
-        f"📊 30dk + 1S + 2S + 4S — 4 periyotun TAMAMINDA sinyal\n"
+        f"🚨 <b>BB Konfirmasyon — Değişiklik Var!</b>\n"
+        f"🕐 {now_str}  |  30dk+1S+2S+4S\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
     )
 
-    if konfirm_al:
-        msg += f"🟢 <b>AL — {len(konfirm_al)} Hisse</b>\n"
-        msg += "<i>Alt banda değdi / aşağı kırdı (tüm periyotlar)</i>\n"
-        for r in konfirm_al:
-            deg = f"+{r['degisim']:.2f}%" if r['degisim'] >= 0 else f"{r['degisim']:.2f}%"
-            # Her periyotun fiyatını göster
-            per_str = "  ".join([
-                f"{p['key'].upper()}:{r['detay'][p['key']]['fiyat']:.2f}"
-                for p in PERIYOTLAR
-            ])
+    # Mevcut AL listesi
+    if yeni_al_set:
+        msg += f"🟢 <b>AL ({len(yeni_al_set)} hisse)</b>\n"
+        for ticker in sorted(yeni_al_set):
+            ref = yeni_durum[ticker]['data']['4h']
+            deg = f"+{ref['degisim']:.2f}%" if ref['degisim'] >= 0 else f"{ref['degisim']:.2f}%"
+            etiket = " 🆕" if ticker in yeni_gelen_al else (" 🔄" if ticker in al_sat_gecis else "")
             msg += (
-                f"\n  📌 <b>{r['ticker']}</b>  {r['fiyat']:.2f}₺  {deg}\n"
-                f"  BB→  Alt:{r['bb_alt']:.2f}  Orta:{r['bb_mid']:.2f}  Üst:{r['bb_ust']:.2f}\n"
-                f"  {per_str}\n"
+                f"  📌 <b>{ticker}</b>{etiket}  {ref['fiyat']:.2f}₺  {deg}\n"
+                f"     BB Alt:{ref['bb_alt']:.2f}  Orta:{ref['bb_mid']:.2f}  Üst:{ref['bb_ust']:.2f}\n"
             )
 
-    if konfirm_al and konfirm_sat:
-        msg += "━━━━━━━━━━━━━━━━━━━━━━━\n"
+    if yeni_al_set and yeni_sat_set:
+        msg += "─────────────────────\n"
 
-    if konfirm_sat:
-        msg += f"🔴 <b>SAT — {len(konfirm_sat)} Hisse</b>\n"
-        msg += "<i>Üst banda değdi / yukarı kırdı (tüm periyotlar)</i>\n"
-        for r in konfirm_sat:
-            deg = f"+{r['degisim']:.2f}%" if r['degisim'] >= 0 else f"{r['degisim']:.2f}%"
-            per_str = "  ".join([
-                f"{p['key'].upper()}:{r['detay'][p['key']]['fiyat']:.2f}"
-                for p in PERIYOTLAR
-            ])
+    # Mevcut SAT listesi
+    if yeni_sat_set:
+        msg += f"🔴 <b>SAT ({len(yeni_sat_set)} hisse)</b>\n"
+        for ticker in sorted(yeni_sat_set):
+            ref = yeni_durum[ticker]['data']['4h']
+            deg = f"+{ref['degisim']:.2f}%" if ref['degisim'] >= 0 else f"{ref['degisim']:.2f}%"
+            etiket = " 🆕" if ticker in yeni_gelen_sat else (" 🔄" if ticker in sat_al_gecis else "")
             msg += (
-                f"\n  📌 <b>{r['ticker']}</b>  {r['fiyat']:.2f}₺  {deg}\n"
-                f"  BB→  Alt:{r['bb_alt']:.2f}  Orta:{r['bb_mid']:.2f}  Üst:{r['bb_ust']:.2f}\n"
-                f"  {per_str}\n"
+                f"  📌 <b>{ticker}</b>{etiket}  {ref['fiyat']:.2f}₺  {deg}\n"
+                f"     BB Alt:{ref['bb_alt']:.2f}  Orta:{ref['bb_mid']:.2f}  Üst:{ref['bb_ust']:.2f}\n"
             )
 
-    msg += "\n━━━━━━━━━━━━━━━━━━━━━━━\n⚠️ <i>Yatırım tavsiyesi değildir.</i>"
+    # Listeden çıkanlar
+    cikanlar = []
+    for t in giden_al:  cikanlar.append(f"{t}(AL çıktı)")
+    for t in giden_sat: cikanlar.append(f"{t}(SAT çıktı)")
+    if cikanlar:
+        msg += f"─────────────────────\n"
+        msg += f"⬜ <b>Listeden çıktı:</b> {', '.join(cikanlar)}\n"
+
+    msg += "━━━━━━━━━━━━━━━━━━━━━━━\n"
+    msg += "<i>🆕 Yeni  🔄 Yön değiştirdi</i>\n"
+    msg += "⚠️ <i>Yatırım tavsiyesi değildir.</i>"
 
     if len(msg) > 4000: msg = msg[:3990] + "\n..."
     tg(msg)
+
+    # Durumu güncelle
+    onceki_durum = yeni_durum
 
 # ── GÜNLÜK ÖZET ───────────────────────────────────────────────────────────────
 def gunluk_ozet():
@@ -250,16 +252,19 @@ def gunluk_ozet():
     msg = (
         f"📋 <b>Günlük Özet — {now}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🟢 AL konfirmasyon: <b>{len(al_u)} hisse</b>\n"
+        f"🟢 AL sinyali veren: <b>{len(al_u)} hisse</b>\n"
     )
     if al_u:
         msg += "  " + "  ".join(f"<b>{t}</b>" for t in al_u) + "\n"
-    msg += f"\n🔴 SAT konfirmasyon: <b>{len(sat_u)} hisse</b>\n"
+    msg += f"\n🔴 SAT sinyali veren: <b>{len(sat_u)} hisse</b>\n"
     if sat_u:
         msg += "  " + "  ".join(f"<b>{t}</b>" for t in sat_u) + "\n"
     msg += "\n🕐 Borsa kapandı. İyi akşamlar! 👋\n⚠️ <i>Yatırım tavsiyesi değildir.</i>"
     tg(msg)
     gun_al.clear(); gun_sat.clear()
+    # Gün sonu durumu sıfırla
+    global onceki_durum
+    onceki_durum = {}
 
 # ── GİRİŞ NOKTASI ─────────────────────────────────────────────────────────────
 def main():
@@ -270,6 +275,7 @@ def main():
         f"📊 30dk · 1S · 2S · 4S — 4 periyot konfirmasyon\n"
         f"🟢 AL:  4 periyotta BB alt kırılımı\n"
         f"🔴 SAT: 4 periyotta BB üst kırılımı\n"
+        f"🔕 Değişiklik yoksa mesaj gönderilmez\n"
         f"⏰ Tarama: 15 dakikada bir (10:00-18:00)\n"
         f"📋 Günlük özet: {DAILY_SUMMARY}\n"
         f"🕐 {datetime.datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
